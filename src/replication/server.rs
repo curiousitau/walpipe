@@ -396,7 +396,7 @@ impl ReplicationServer {
 
             writer.write_u8(b'r')?;
             writer.write_u64(self.state.received_lsn)?;
-            writer.write_u64(self.state.received_lsn)?;
+            writer.write_u64(self.state.applied_lsn)?;
             writer.write_u64(self.state.applied_lsn)?;
             writer.write_i64(timestamp)?;
             writer.write_u8(0)?;
