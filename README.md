@@ -215,6 +215,49 @@ The implementation consists of several key modules:
 3. **Message Processing**: Handlers for all logical replication message types (BEGIN, COMMIT, INSERT, UPDATE, DELETE, TRUNCATE, etc.)
 4. **Feedback System**: Implements the feedback protocol to acknowledge processed WAL positions
 
+### Hook0 sink and `event_history`
+
+The hook0 sink runs a side-channel batch recorder
+(`src/events/sink/event_history.rs`) that writes a `DELIVERED` row to
+`public.event_history` for every event handed off to hook0. This is
+the same `event_history` the application uses — it's an event-sourcing
+state-transition log:
+
+```
+event_stream (the event)
+  └─ event_history (one row per state transition, FK on event_id)
+       ├─ status='CREATED'   ← written by event_stream's after-insert trigger
+       └─ status='DELIVERED' ← written by walpipe after hook0 dispatch
+```
+
+Walpipe's INSERT must use the live schema (`event_id` FK, `status`,
+`metadata`, `changed_at` defaults to `now()`). Earlier versions of the
+recorder targeted a hypothetical private schema (`event_id PK`,
+`event_type`, `source_created_at`, `delivered_at`) that doesn't exist
+in this DB; flushes silently failed with `db error` until the SQL was
+aligned. Don't reintroduce a private schema — the application reads
+the same table to derive delivery state.
+
+### Two PG connections, two TLS stories (gotcha)
+
+Walpipe holds two distinct connections to Postgres:
+
+1. **Replication connection** (`PGConnection` in `utils/connection.rs`)
+   uses **libpq** via `libpq-sys`. libpq honours `sslmode=require`
+   internally and handles TLS handshake itself.
+2. **`event_history` recorder** (`events/sink/event_history.rs`) uses
+   **tokio-postgres** (pure Rust). tokio-postgres negotiates TLS but
+   needs an *actual TLS implementation* passed in — `NoTls` will fail
+   the handshake against any server that requires SSL.
+
+Against managed Postgres (Azure, RDS, etc.) the recorder must be
+constructed with `postgres-native-tls::MakeTlsConnector::new(
+native_tls::TlsConnector::builder().build()?)`. The runtime container
+also needs `ca-certificates` installed so native-tls has a trust
+store — see `Dockerfile`. If you ever change the recorder back to
+`NoTls` for local-dev convenience, gate it on the conn string instead
+of removing the TLS path outright.
+
 ## Message Flow Sequence Diagram
 
 The following sequence diagram shows the interaction between PostgreSQL and walpipe during logical replication:
