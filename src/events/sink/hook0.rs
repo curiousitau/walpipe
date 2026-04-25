@@ -492,6 +492,6 @@ impl Hook0EventSink {
             event_type: event_row.event_type.clone(),
             source_created_at: event_row.created_at,
         };
-        recorder.record(record).await;
+        recorder.record(record);
     }
 }

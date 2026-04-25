@@ -28,6 +28,23 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_postgres::Client;
 use tracing::{debug, error, info, warn};
 
+/// Hard upper bound on a single flush. Anything longer indicates a hung
+/// socket or a runaway batch — drop it and reconnect rather than block
+/// the recorder forever.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Idle keepalive for the tokio-postgres connection. Azure Postgres has
+/// been observed to silently drop idle TCP at the load-balancer layer;
+/// keepalives surface that as a connection error in seconds instead of a
+/// query that hangs forever.
+const KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
+
+/// Linux-only: fail any send whose ACKs aren't received within this
+/// window. Belt-and-braces alongside keepalives — keepalives only fire
+/// on idle connections, this fires on actively-stuck writes too.
+#[cfg(target_os = "linux")]
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// One record to insert into event_history.
 #[derive(Debug)]
 pub struct EventHistoryRecord {
@@ -77,60 +94,51 @@ impl EventHistoryRecorder {
         batch_size: usize,
         flush_interval: Duration,
     ) -> Result<(Self, Entry), String> {
-        // Azure Postgres requires TLS; the conn string carries `sslmode=require`,
-        // and tokio-postgres negotiates the upgrade but needs a real TLS impl
-        // to perform the handshake. The replication path uses libpq which
-        // handles TLS internally, hence the divergence.
-        let tls_connector = native_tls::TlsConnector::builder()
-            .build()
-            .map_err(|e| format!("event_history recorder: build TLS connector: {e}"))?;
-        let make_tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
-
-        let (client, conn) = tokio_postgres::connect(conn_str, make_tls)
-            .await
-            .map_err(|e| format!("event_history recorder: connect failed: {e}"))?;
-
-        // The connection future drives socket I/O for the client; without a
-        // task spawning it, queries on `client` will hang forever.
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                error!("event_history recorder connection lost: {e}");
-            }
-        });
-
-        client
-            .simple_query("SELECT 1")
-            .await
-            .map_err(|e| format!("event_history recorder: connectivity check failed: {e}"))?;
+        let client = connect_client(conn_str).await?;
 
         let (tx, rx) = mpsc::channel(1024);
         let (done_tx, done_rx) = oneshot::channel();
 
         tokio::spawn(Self::flush_task(
-            client, rx, done_tx, batch_size, flush_interval,
+            conn_str.to_string(),
+            client,
+            rx,
+            done_tx,
+            batch_size,
+            flush_interval,
         ));
 
         info!(
-            "event_history recorder started (batch={}, interval={:?}",
+            "event_history recorder started (batch={}, interval={:?})",
             batch_size, flush_interval
         );
         Ok((Self { tx }, Entry { done_rx }))
     }
 
-    /// Queue a delivered-event record.
+    /// Queue a delivered-event record without ever blocking the caller.
     ///
-    /// Non-blocking at the DB level — the background task batches & flushes.
-    /// Awaits the channel send to avoid dropping events under backpressure
-    /// (in practice the channel never fills because the replication loop is
-    /// single-threaded and the background task keeps up).
-    pub async fn record(&self, record: EventHistoryRecord) {
-        if self.tx.send(record).await.is_err() {
-            error!("event_history recorder channel closed");
+    /// The recorder is best-effort: under sustained backpressure (DB hung,
+    /// flush_task slow) we drop with a warning rather than block the WAL
+    /// replication loop, which would freeze the slot's `confirmed_flush_lsn`
+    /// and stall hook0 dispatch for everyone. The slot's at-least-once
+    /// guarantee comes from Postgres, not from this side-channel.
+    pub fn record(&self, record: EventHistoryRecord) {
+        match self.tx.try_send(record) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(rec)) => {
+                warn!(
+                    "event_history recorder channel full; dropping record for event_id {}",
+                    rec.event_id
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                error!("event_history recorder channel closed");
+            }
         }
     }
 
-    #[allow(clippy::unused_async)]
     async fn flush_task(
+        conn_str: String,
         mut client: Client,
         mut rx: mpsc::Receiver<EventHistoryRecord>,
         done_tx: oneshot::Sender<()>,
@@ -148,19 +156,13 @@ impl EventHistoryRecorder {
                         Some(rec) => {
                             buffer.push(rec);
                             if buffer.len() >= batch_size {
-                                if let Err(e) = Self::flush_batch(&mut client, &buffer).await {
-                                    error!("event_history flush error: {e}");
-                                } else {
-                                    buffer.clear();
-                                }
+                                Self::flush_or_recover(&conn_str, &mut client, &mut buffer).await;
                             }
                         }
                         None => {
                             // All senders dropped — final flush.
                             if !buffer.is_empty() {
-                                if let Err(e) = Self::flush_batch(&mut client, &buffer).await {
-                                    error!("event_history final flush error: {e}");
-                                }
+                                Self::flush_or_recover(&conn_str, &mut client, &mut buffer).await;
                             }
                             let _ = done_tx.send(());
                             break;
@@ -169,13 +171,47 @@ impl EventHistoryRecorder {
                 }
                 _ = interval.tick() => {
                     if !buffer.is_empty() {
-                        if let Err(e) = Self::flush_batch(&mut client, &buffer).await {
-                            warn!("event_history periodic flush error (will retry): {e}");
-                        } else {
-                            buffer.clear();
-                        }
+                        Self::flush_or_recover(&conn_str, &mut client, &mut buffer).await;
                     }
                 }
+            }
+        }
+    }
+
+    /// Time-bounded flush. On any failure (DB error or timeout) drops the
+    /// batch and replaces the client with a fresh connection — a hung
+    /// socket would otherwise poison every subsequent flush attempt and,
+    /// because the buffer is never cleared on failure, the in-memory batch
+    /// would grow without bound.
+    async fn flush_or_recover(
+        conn_str: &str,
+        client: &mut Client,
+        buffer: &mut Vec<EventHistoryRecord>,
+    ) {
+        let count = buffer.len();
+        match tokio::time::timeout(FLUSH_TIMEOUT, Self::flush_batch(client, buffer)).await {
+            Ok(Ok(())) => {
+                buffer.clear();
+                return;
+            }
+            Ok(Err(e)) => {
+                error!("event_history flush error, dropping {count} rows: {e}");
+            }
+            Err(_) => {
+                error!(
+                    "event_history flush timed out after {:?}, dropping {count} rows",
+                    FLUSH_TIMEOUT
+                );
+            }
+        }
+        buffer.clear();
+        match connect_client(conn_str).await {
+            Ok(c) => {
+                *client = c;
+                info!("event_history recorder reconnected after flush failure");
+            }
+            Err(e) => {
+                warn!("event_history recorder reconnect failed: {e}; will retry on next flush");
             }
         }
     }
@@ -200,6 +236,50 @@ impl EventHistoryRecorder {
         debug!("flushed {} event_history rows", batch.len());
         Ok(())
     }
+}
+
+/// Open a tokio-postgres connection with keepalives + (Linux) tcp_user_timeout
+/// configured so a dropped socket surfaces as an error rather than hanging
+/// forever. Used by `EventHistoryRecorder::new` and by the reconnect path
+/// inside `flush_or_recover`.
+///
+/// Azure Postgres requires TLS; the conn string carries `sslmode=require`,
+/// and tokio-postgres negotiates the upgrade but needs a real TLS impl to
+/// perform the handshake. The replication path uses libpq which handles
+/// TLS internally, hence the divergence.
+async fn connect_client(conn_str: &str) -> Result<Client, String> {
+    let tls_connector = native_tls::TlsConnector::builder()
+        .build()
+        .map_err(|e| format!("event_history recorder: build TLS connector: {e}"))?;
+    let make_tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
+
+    let mut cfg: tokio_postgres::Config = conn_str
+        .parse()
+        .map_err(|e| format!("event_history recorder: parse conn string: {e}"))?;
+    cfg.keepalives(true);
+    cfg.keepalives_idle(KEEPALIVES_IDLE);
+    #[cfg(target_os = "linux")]
+    cfg.tcp_user_timeout(TCP_USER_TIMEOUT);
+
+    let (client, conn) = cfg
+        .connect(make_tls)
+        .await
+        .map_err(|e| format!("event_history recorder: connect failed: {e}"))?;
+
+    // The connection future drives socket I/O for the client; without a
+    // task spawning it, queries on `client` will hang forever.
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            error!("event_history recorder connection lost: {e}");
+        }
+    });
+
+    client
+        .simple_query("SELECT 1")
+        .await
+        .map_err(|e| format!("event_history recorder: connectivity check failed: {e}"))?;
+
+    Ok(client)
 }
 
 /// Build the INSERT SQL for a batch of event_history records.
