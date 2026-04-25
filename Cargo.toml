@@ -23,3 +23,5 @@ hook0-client = { rev = "d7642e4ed32e9851eb67114053afcbd9cf9ab614", git = "https:
 	"producer",
 ] }
 tokio-postgres = "0.7"
+native-tls = "0.2"
+postgres-native-tls = "0.5"

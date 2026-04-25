@@ -29,9 +29,11 @@ FROM debian:trixie-slim
 # Set working directory
 WORKDIR /usr/local
 
-# Install runtime PostgreSQL libraries
+# Install runtime PostgreSQL libraries + TLS trust store. ca-certificates
+# is required by the tokio-postgres event_history recorder, which now uses
+# native-tls to honour sslmode=require against Azure Postgres.
 RUN apt-get update && apt-get install -y \
-	libpq5 \
+	libpq5 ca-certificates \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Copy built binary from build stage

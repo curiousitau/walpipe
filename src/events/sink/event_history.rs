@@ -70,9 +70,26 @@ impl EventHistoryRecorder {
         batch_size: usize,
         flush_interval: Duration,
     ) -> Result<(Self, Entry), String> {
-        let (client, _) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
+        // Azure Postgres requires TLS; the conn string carries `sslmode=require`,
+        // and tokio-postgres negotiates the upgrade but needs a real TLS impl
+        // to perform the handshake. The replication path uses libpq which
+        // handles TLS internally, hence the divergence.
+        let tls_connector = native_tls::TlsConnector::builder()
+            .build()
+            .map_err(|e| format!("event_history recorder: build TLS connector: {e}"))?;
+        let make_tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
+
+        let (client, conn) = tokio_postgres::connect(conn_str, make_tls)
             .await
             .map_err(|e| format!("event_history recorder: connect failed: {e}"))?;
+
+        // The connection future drives socket I/O for the client; without a
+        // task spawning it, queries on `client` will hang forever.
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                error!("event_history recorder connection lost: {e}");
+            }
+        });
 
         client
             .simple_query("SELECT 1")
