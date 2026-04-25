@@ -4,14 +4,21 @@
 //! in batches (size or time triggered). Runs a background tokio task so
 //! the replication loop is never blocked by these writes.
 //!
-//! The target table schema (create once on the DB):
+//! event_history is shared with the application (it's an event-sourcing
+//! state-transition log keyed on event_history_id, FK'd to event_stream).
+//! event_stream's after-insert trigger writes a `CREATED` row; walpipe
+//! writes a `DELIVERED` row once a hook0 dispatch succeeds. Each row is a
+//! transition, not a unique key per event — no ON CONFLICT needed.
+//!
+//! Live schema (managed by the application):
 //!
 //! ```sql
-//! CREATE TABLE IF NOT EXISTS event_history (
-//!     event_id          UUID PRIMARY KEY,
-//!     event_type        TEXT NOT NULL,
-//!     source_created_at TIMESTAMPTZ NOT NULL,
-//!     delivered_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+//! CREATE TABLE event_history (
+//!     event_history_id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+//!     event_id         UUID NOT NULL REFERENCES event_stream(event_id) ON DELETE CASCADE,
+//!     status           TEXT NOT NULL,
+//!     changed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+//!     metadata         JSONB DEFAULT '{}'::jsonb
 //! );
 //! ```
 
@@ -181,7 +188,15 @@ impl EventHistoryRecorder {
         let sql = build_insert_sql(batch);
 
         debug!("flushing {} event_history rows", batch.len());
-        client.simple_query(&sql).await.map_err(|e| format!("flush_batch: {e}"))?;
+        client.simple_query(&sql).await.map_err(|e| {
+            // tokio_postgres::Error's Display is intentionally generic
+            // ("db error"); the actual SQLSTATE / message lives on the
+            // source. Surface both so flush failures are diagnosable.
+            let detail = std::error::Error::source(&e)
+                .map(|s| format!(": {s}"))
+                .unwrap_or_default();
+            format!("flush_batch: {e}{detail}")
+        })?;
         debug!("flushed {} event_history rows", batch.len());
         Ok(())
     }
@@ -191,7 +206,7 @@ impl EventHistoryRecorder {
 /// Pure function — easy to test.
 pub(crate) fn build_insert_sql(batch: &[EventHistoryRecord]) -> String {
     let mut sql = String::from(
-        "INSERT INTO event_history (event_id, event_type, source_created_at, delivered_at) VALUES ",
+        "INSERT INTO event_history (event_id, status, metadata) VALUES ",
     );
     for (i, rec) in batch.iter().enumerate() {
         if i > 0 {
@@ -199,13 +214,12 @@ pub(crate) fn build_insert_sql(batch: &[EventHistoryRecord]) -> String {
         }
         let ts = rec.source_created_at.format("%Y-%m-%d %H:%M:%S%.f UTC");
         sql.push_str(&format!(
-            "('{}', '{}', '{}', NOW())",
+            "('{}', 'DELIVERED', jsonb_build_object('trigger', 'walpipe_dispatch', 'event_type', '{}', 'source_created_at', '{}'))",
             rec.event_id,
             rec.event_type.replace('\'', "''"),
             ts.to_string().replace('\'', "''"),
         ));
     }
-    sql.push_str(" ON CONFLICT (event_id) DO NOTHING");
     sql
 }
 
@@ -228,10 +242,11 @@ mod tests {
         let batch = vec![make_record(id, "user.created", Utc::now())];
         let sql = build_insert_sql(&batch);
 
-        assert!(sql.starts_with("INSERT INTO event_history"));
+        assert!(sql.starts_with("INSERT INTO event_history (event_id, status, metadata) VALUES"));
         assert!(sql.contains(&id.to_string()));
+        assert!(sql.contains("'DELIVERED'"));
         assert!(sql.contains("user.created"));
-        assert!(sql.ends_with("ON CONFLICT (event_id) DO NOTHING"));
+        assert!(sql.contains("'walpipe_dispatch'"));
     }
 
     #[test]
@@ -242,8 +257,8 @@ mod tests {
         ];
         let sql = build_insert_sql(&batch);
 
-        // Should contain two value tuples separated by comma
-        assert!(sql.contains("NOW()),("));
+        // Should contain two value tuples separated by comma.
+        assert!(sql.contains(")),("));
         assert!(sql.contains("type.a"));
         assert!(sql.contains("type.b"));
     }
@@ -259,15 +274,10 @@ mod tests {
 
     #[test]
     fn test_flush_batch_empty_returns_ok() {
-        // Can't test with real Client, but we verify the empty-path logic
-        // by checking that build_insert_sql is never called for empty batches
-        // (the flush_batch method returns Ok early for empty input).
-        // This is covered by the unit test below which verifies the behavior
-        // indirectly: an empty batch produces no SQL.
+        // flush_batch returns Ok early for empty input; this verifies the
+        // SQL builder still produces a syntactically-recognisable prefix
+        // when called directly with an empty batch.
         let sql = build_insert_sql(&[]);
         assert!(sql.contains("VALUES "));
-        assert!(sql.ends_with("ON CONFLICT (event_id) DO NOTHING"));
-        // The VALUES clause has no rows — which is fine since flush_batch
-        // returns early for empty batches before calling this.
     }
 }
