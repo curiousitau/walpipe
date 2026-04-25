@@ -178,16 +178,13 @@ mod test_graceful_shutdown;
 /// Returns `Ok(())` when replication completes or an error if any step fails
 async fn run_replication_server(
     config: ReplicationConfig,
-    shutdown_signal: Arc<AtomicBool>, 
+    shutdown_signal: Arc<AtomicBool>,
 ) -> ReplicationResult<()> {
-    let mut server = ReplicationServer::new(config, shutdown_signal)?;
+    let mut server = ReplicationServer::new(config, shutdown_signal).await?;
 
-    server
-        .identify_system()?;
+    server.identify_system()?;
 
-    server
-        .create_replication_slot_and_start()
-        .await?;
+    server.create_replication_slot_and_start().await?;
 
     Ok(())
 }

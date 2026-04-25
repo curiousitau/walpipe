@@ -246,12 +246,11 @@ impl ReplicationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
 
     #[test]
     fn test_config_from_env_missing_database_url() {
-        // Clear the DATABASE_URL to test error case
-        env::remove_var("DATABASE_URL");
+        unsafe { std::env::remove_var("DATABASE_URL") };
+        unsafe { std::env::remove_var("EVENT_SINK") };
 
         let result = ReplicationConfig::from_env();
         assert!(result.is_err());
@@ -260,26 +259,32 @@ mod tests {
 
     #[test]
     fn test_config_with_valid_database_url() {
-        // Set a valid DATABASE_URL
-        env::set_var("DATABASE_URL", "postgresql://test@localhost/test");
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgresql://test@localhost/test");
+            std::env::set_var("EVENT_SINK", "stdout");
+        }
 
         let result = ReplicationConfig::from_env();
         assert!(result.is_ok());
 
         let config = result.unwrap();
-        assert_eq!(config.slot_name, "sub"); // default value
-        assert_eq!(config.publication_name, "pub"); // default value
-        assert_eq!(config.event_sink_type(), "stdout"); // default value
+        assert_eq!(config.slot_name, "sub");
+        assert_eq!(config.publication_name, "pub");
+        assert!(config.uses_stdout_sink());
 
-        // Clean up
-        env::remove_var("DATABASE_URL");
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("EVENT_SINK");
+        }
     }
 
     #[test]
     fn test_config_http_sink_requires_endpoint() {
-        env::set_var("DATABASE_URL", "postgresql://test@localhost/test");
-        env::set_var("EVENT_SINK", "http");
-        // Don't set HTTP_ENDPOINT_URL
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgresql://test@localhost/test");
+            std::env::set_var("EVENT_SINK", "http");
+            std::env::remove_var("HTTP_ENDPOINT_URL");
+        }
 
         let result = ReplicationConfig::from_env();
         assert!(result.is_err());
@@ -290,24 +295,29 @@ mod tests {
                 .contains("HTTP_ENDPOINT_URL")
         );
 
-        // Clean up
-        env::remove_var("DATABASE_URL");
-        env::remove_var("EVENT_SINK");
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("EVENT_SINK");
+        }
     }
 
     #[test]
     fn test_config_hook0_sink_requires_all_fields() {
-        env::set_var("DATABASE_URL", "postgresql://test@localhost/test");
-        env::set_var("EVENT_SINK", "hook0");
-        env::set_var("HOOK0_API_URL", "https://api.hook0.com");
-        // Missing HOOK0_APPLICATION_ID and HOOK0_API_TOKEN
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgresql://test@localhost/test");
+            std::env::set_var("EVENT_SINK", "hook0");
+            std::env::set_var("HOOK0_API_URL", "https://api.hook0.com");
+            std::env::remove_var("HOOK0_APPLICATION_ID");
+            std::env::remove_var("HOOK0_API_TOKEN");
+        }
 
         let result = ReplicationConfig::from_env();
         assert!(result.is_err());
 
-        // Clean up
-        env::remove_var("DATABASE_URL");
-        env::remove_var("EVENT_SINK");
-        env::remove_var("HOOK0_API_URL");
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("EVENT_SINK");
+            std::env::remove_var("HOOK0_API_URL");
+        }
     }
 }

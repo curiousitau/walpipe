@@ -8,9 +8,11 @@
 pub use crate::protocol::messages::ReplicationState;
 
 
-
 #[cfg(test)]
 mod tests {
+    use crate::protocol::messages::RelationInfo;
+    use crate::utils::binary::Oid;
+
     use super::*;
 
     #[test]
@@ -18,7 +20,7 @@ mod tests {
         let state = ReplicationState::new();
         assert_eq!(state.received_lsn, 0);
         assert_eq!(state.applied_lsn, 0);
-        assert!(!state.has_received_data());
+        assert_eq!(state.relations.len(), 0);
     }
 
     #[test]
@@ -28,7 +30,6 @@ mod tests {
         // Test received LSN updates
         state.update_lsn(100);
         assert_eq!(state.received_lsn, 100);
-        assert!(state.has_received_data());
 
         // Test that lower LSN doesn't override higher one
         state.update_lsn(50);
@@ -37,18 +38,20 @@ mod tests {
         // Test applied LSN updates
         state.update_applied_lsn(80);
         assert_eq!(state.applied_lsn, 80);
+
+        // Zero should be ignored
+        state.update_lsn(0);
+        assert_eq!(state.received_lsn, 100);
     }
 
     #[test]
     fn test_feedback_timing() {
-        let state = ReplicationState::new();
+        let mut state = ReplicationState::new();
+        let initial = state.last_feedback_time;
 
-        // Should not send feedback immediately
-        assert!(!state.should_send_feedback(1));
-
-        // Update feedback time and check again
+        std::thread::sleep(std::time::Duration::from_millis(10));
         state.update_feedback_time();
-        assert!(!state.should_send_feedback(1));
+        assert!(state.last_feedback_time > initial);
     }
 
     #[test]
@@ -56,7 +59,7 @@ mod tests {
         let mut state = ReplicationState::new();
 
         let relation = RelationInfo {
-            oid: 12345,
+            oid: 12345 as Oid,
             namespace: "public".to_string(),
             relation_name: "test_table".to_string(),
             replica_identity: 'd',
@@ -68,41 +71,11 @@ mod tests {
         state.add_relation(relation.clone());
 
         // Retrieve relation
-        let retrieved = state.get_relation(12345);
+        let retrieved = state.get_relation(12345 as Oid);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().relation_name, "test_table");
 
         // Non-existent relation should return None
-        assert!(state.get_relation(99999).is_none());
-    }
-
-    #[test]
-    fn test_state_reset() {
-        let mut state = ReplicationState::new();
-
-        // Add some data
-        state.update_lsn(100);
-        state.update_applied_lsn(80);
-        state.add_relation(RelationInfo {
-            oid: 12345,
-            namespace: "public".to_string(),
-            relation_name: "test_table".to_string(),
-            replica_identity: 'd',
-            column_count: 1,
-            columns: vec![],
-        });
-
-        // Verify data exists
-        assert!(state.has_received_data());
-        assert!(state.get_relation(12345).is_some());
-
-        // Reset state
-        state.reset();
-
-        // Verify reset
-        assert_eq!(state.received_lsn, 0);
-        assert_eq!(state.applied_lsn, 0);
-        assert!(!state.has_received_data());
-        assert!(state.get_relation(12345).is_none());
+        assert!(state.get_relation(99999 as Oid).is_none());
     }
 }

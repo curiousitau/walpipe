@@ -379,6 +379,22 @@ The feedback mechanism ensures PostgreSQL knows which LSN positions have been re
 
 1. **No data received**: Check that your publication includes the tables being modified
 2. **"Unknown relation"**: The replication stream may be out of sync; restart the application
+3. **Slot falls behind / silent disconnect**: On Azure PostgreSQL (and other managed services), the replication slot can fall behind the WAL retention window. When this happens, walpipe stays connected but stops receiving data — the slot shows `active = f` and no new events are forwarded even though `event_stream` has inserts. The fix is to drop and recreate the slot to reset to the current WAL position:
+
+   ```bash
+   # Scale walpipe down first (slot cannot be dropped while active)
+   kubectl scale deployment/walpipe --replicas=0
+
+   # Drop and recreate the slot
+   psql "postgresql://...?sslmode=require" \
+     -c "SELECT pg_drop_replication_slot('walpipe_slot');" \
+     -c "SELECT * FROM pg_create_logical_replication_slot('walpipe_slot', 'pgoutput');"
+
+   # Scale back up
+   kubectl scale deployment/walpipe --replicas=1
+   ```
+
+   After recreating, walpipe will start from the current WAL position and pick up new events. Events that occurred while the slot was behind will be lost (walpipe never received them).
 
 ### docker Build and run:
 

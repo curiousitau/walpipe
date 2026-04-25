@@ -7,6 +7,7 @@ use crate::core::errors::ReplicationResult;
 use super::EventSink;
 
 pub mod event_formatter;
+pub mod event_history;
 pub mod hook0;
 pub mod hook0_error;
 pub mod http;
@@ -17,10 +18,14 @@ pub mod stdout;
 pub struct EventSinkRegistry;
 
 impl EventSinkRegistry {
-    /// Create an event sink based on configuration
+    /// Create an event sink based on configuration.
+    ///
+    /// `event_history_recorder` is optional and only used by the Hook0 sink
+    /// to record successful deliveries to the `event_history` table.
     pub fn create_sink(
         sink_type: &crate::core::config::EventSinkType,
         config: &crate::core::config::ReplicationConfig,
+        event_history_recorder: Option<std::sync::Arc<event_history::EventHistoryRecorder>>,
     ) -> ReplicationResult<std::sync::Arc<dyn EventSink + Send + Sync>> {
         match sink_type {
             crate::core::config::EventSinkType::Http => {
@@ -48,7 +53,7 @@ impl EventSinkRegistry {
                         application_id: app_id,
                         api_token: api_token.to_string(),
                     };
-                    let sink = hook0::Hook0EventSink::new(hook0_config)
+                    let sink = hook0::Hook0EventSink::new(hook0_config, event_history_recorder)
                         .map_err(|e| crate::core::errors::ReplicationError::config(e))?;
                     Ok(std::sync::Arc::new(sink) as std::sync::Arc<dyn EventSink + Send + Sync>)
                 } else {

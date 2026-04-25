@@ -21,6 +21,7 @@ use super::super::EventSink;
 use crate::core::email_config::EmailConfig;
 use crate::core::errors::{ReplicationError, ReplicationResult};
 use crate::protocol::messages::ReplicationMessage;
+use super::event_history::{EventHistoryRecord, EventHistoryRecorder};
 use super::hook0_error::Hook0ErrorId;
 use super::pg_type_conversion::{
     ColumnValue, ReplicationEventDecoder, ReplicationRow, parse_timestamptz,
@@ -46,6 +47,7 @@ pub struct Hook0EventSink {
     pub(crate) email_config: Option<EmailConfig>,
     pub(crate) decoder: Arc<Mutex<ReplicationEventDecoder>>,
     unknown_event_types: Arc<Mutex<HashMap<String, DateTime<Local>>>>,
+    event_history_recorder: Option<Arc<EventHistoryRecorder>>,
 }
 
 /// event table row
@@ -263,6 +265,7 @@ impl EventSink for Hook0EventSink {
             match self.hook0_client.send_event(&hook0_event).await {
                 Ok(_) => {
                     debug!("Successfully sent event to Hook0 API");
+                    Self::record_event_history(&self.event_history_recorder, &event_row).await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -302,7 +305,7 @@ impl EventSink for Hook0EventSink {
                                             "Event already ingested by Hook0 API. Event ID: {}, Error: {}",
                                             event_id, e
                                         );
-
+                                        Self::record_event_history(&self.event_history_recorder, &event_row).await;
                                         return Ok(()); // Skip the event if already ingested
                                     }
                                     Hook0ErrorId::InternalServerError => {
@@ -393,7 +396,10 @@ impl EventSink for Hook0EventSink {
 
 impl Hook0EventSink {
     /// Create a new Hook0 event sink
-    pub fn new(config: Hook0EventSinkConfig) -> Result<Self, String> {
+    pub fn new(
+        config: Hook0EventSinkConfig,
+        event_history_recorder: Option<Arc<EventHistoryRecorder>>,
+    ) -> Result<Self, String> {
         // Validate email configuration at startup
         let email_config = match EmailConfig::from_env() {
             Ok(email_config) => Some(email_config),
@@ -423,6 +429,7 @@ impl Hook0EventSink {
             email_config,
             decoder: Arc::new(Mutex::new(ReplicationEventDecoder::new())),
             unknown_event_types: Arc::new(Mutex::new(HashMap::new())),
+            event_history_recorder,
         })
     }
 
@@ -470,5 +477,21 @@ impl Hook0EventSink {
         } else {
             debug!("Email notification sent successfully");
         }
+    }
+
+    async fn record_event_history(
+        recorder: &Option<Arc<EventHistoryRecorder>>,
+        event_row: &EventTableRow,
+    ) {
+        let recorder = match recorder {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let record = EventHistoryRecord {
+            event_id: event_row.event_id,
+            event_type: event_row.event_type.clone(),
+            source_created_at: event_row.created_at,
+        };
+        recorder.record(record).await;
     }
 }

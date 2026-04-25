@@ -8,17 +8,32 @@
 
 use crate::core::config::ReplicationConfig;
 use crate::core::errors::ReplicationResult;
+use crate::events::sink::event_history::{EventHistoryEntry, EventHistoryRecorder};
 use crate::events::{EventSink, EventSinkRegistry};
 use crate::protocol::buffer::{BufferReader, BufferWriter};
 use crate::protocol::messages::*;
 use crate::protocol::parser::MessageParser;
-use crate::utils::connection::PGConnection;
+use crate::utils::connection::{CopyData, PGConnection};
 use crate::utils::timestamp::system_time_to_postgres_timestamp;
 use libpq_sys::ExecStatusType;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tracing::{debug, error, info, warn};
+
+/// Newtype so we can hand a bare libpq socket to [`AsyncFd`] without taking
+/// ownership of the descriptor — the underlying `PGconn` retains responsibility
+/// for closing it on `PQfinish`.
+struct PgSocket(RawFd);
+
+impl AsRawFd for PgSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
 
 /// Main replication server that manages the logical replication connection
 ///
@@ -30,6 +45,8 @@ pub struct ReplicationServer {
     config: ReplicationConfig,
     state: ReplicationState,
     event_sink: Option<Arc<dyn EventSink + Send + Sync>>,
+    event_history_recorder: Option<Arc<EventHistoryRecorder>>,
+    event_history_entry: Option<EventHistoryEntry>,
     shutdown_signal: Arc<AtomicBool>,
 }
 
@@ -38,7 +55,7 @@ impl ReplicationServer {
     ///
     /// Establishes database connection and initializes the appropriate event sink
     /// based on configuration (Hook0, HTTP endpoint, or STDOUT fallback).
-    pub fn new(
+    pub async fn new(
         config: ReplicationConfig,
         shutdown_signal: Arc<AtomicBool>,
     ) -> ReplicationResult<Self> {
@@ -46,11 +63,35 @@ impl ReplicationServer {
         let connection = PGConnection::connect(&config.connection_string)?;
         info!("Successfully connected to database server");
 
+        // Create event_history recorder for hook0 sink
+        let (event_history_recorder, event_history_entry) =
+            if config.uses_hook0_sink() {
+                let (recorder, entry) = EventHistoryRecorder::new(
+                    &config.connection_string,
+                    100,
+                    Duration::from_secs(10),
+                )
+                .await
+                .map_err(|e| {
+                    crate::core::errors::ReplicationError::config(format!(
+                        "Failed to create event_history recorder: {}",
+                        e
+                    ))
+                })?;
+                (Some(Arc::new(recorder)), Some(entry))
+            } else {
+                (None, None)
+            };
+
         // Configure event sink based on configuration
         let sink_type = config.event_sink_type();
         info!("Initializing {} event sink", sink_type);
 
-        let event_sink = match EventSinkRegistry::create_sink(sink_type, &config) {
+        let event_sink = match EventSinkRegistry::create_sink(
+            sink_type,
+            &config,
+            event_history_recorder.clone(),
+        ) {
             Ok(sink) => {
                 info!("Successfully initialized {} event sink", sink_type);
                 Some(sink)
@@ -68,6 +109,8 @@ impl ReplicationServer {
             config,
             state: ReplicationState::new(),
             event_sink,
+            event_history_recorder,
+            event_history_entry,
             shutdown_signal,
         })
     }
@@ -244,55 +287,77 @@ impl ReplicationServer {
     }
 
     async fn replication_loop(&mut self) -> ReplicationResult<()> {
-        loop {
-            // Check for shutdown signal before each iteration
+        // Switch the connection into non-blocking mode and register its socket
+        // with tokio's reactor so we can `await` data instead of blocking the
+        // worker thread inside libpq.
+        self.connection.set_nonblocking(true)?;
+        let socket = PgSocket(self.connection.socket()?);
+        let async_fd = AsyncFd::with_interest(socket, Interest::READABLE)?;
+
+        // Cap how long we'll park on the socket before checking the shutdown
+        // flag and the feedback timer again. Stay well under the feedback
+        // interval so periodic feedback still fires when WAL is quiet.
+        let idle_wakeup = Duration::from_secs(
+            self.config
+                .feedback_interval_secs
+                .saturating_sub(1)
+                .max(1),
+        );
+
+        let stop_reason = 'outer: loop {
             if self.shutdown_signal.load(Ordering::SeqCst) {
-                info!("Shutdown signal received, initiating graceful shutdown");
-                self.perform_graceful_shutdown().await?;
-                break;
+                break "shutdown signal";
             }
 
             self.check_and_send_feedback()?;
 
-            match self.connection.get_copy_data()? {
-                None => {
-                    info!("No data received, continuing");
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-                Some(data) => {
-                    if data.is_empty() {
-                        continue;
-                    }
-                    debug!(
-                        "PQgetCopyData returned: {}, data len: {}",
-                        data[0] as char,
-                        data.len()
-                    );
-
-                    match data[0] as char {
-                        'k' => {
-                            self.process_keepalive_message(&data)?;
+            // Drain everything libpq has already buffered before going back
+            // to sleep on the socket.
+            loop {
+                match self.connection.get_copy_data()? {
+                    CopyData::Done => break 'outer "stream ended",
+                    CopyData::WouldBlock => break,
+                    CopyData::Row(data) => {
+                        if data.is_empty() {
+                            continue;
                         }
-                        'w' => {
-                            self.process_wal_message(&data).await?;
+                        debug!(
+                            "PQgetCopyData returned: {}, data len: {}",
+                            data[0] as char,
+                            data.len()
+                        );
 
-                            // Check for shutdown signal after processing a WAL message
-                            if self.shutdown_signal.load(Ordering::SeqCst) {
-                                info!(
-                                    "Shutdown signal received after processing WAL message, initiating graceful shutdown"
-                                );
-                                self.perform_graceful_shutdown().await?;
-                                break;
+                        match data[0] as char {
+                            'k' => self.process_keepalive_message(&data)?,
+                            'w' => {
+                                self.process_wal_message(&data).await?;
+                                if self.shutdown_signal.load(Ordering::SeqCst) {
+                                    break 'outer "shutdown after WAL message";
+                                }
                             }
-                        }
-                        _ => {
-                            warn!("Received unknown message type: {}", data[0] as char);
+                            _ => warn!(
+                                "Received unknown message type: {}",
+                                data[0] as char
+                            ),
                         }
                     }
                 }
             }
-        }
+
+            // Wait for more data, but wake up periodically to re-check the
+            // shutdown flag and send keepalive feedback.
+            match tokio::time::timeout(idle_wakeup, async_fd.readable()).await {
+                Err(_) => continue, // periodic wakeup
+                Ok(Ok(mut guard)) => {
+                    self.connection.consume_input()?;
+                    guard.clear_ready();
+                }
+                Ok(Err(e)) => return Err(crate::core::errors::ReplicationError::from(e)),
+            }
+        };
+
+        info!("Replication loop stopping: {}", stop_reason);
+        self.perform_graceful_shutdown().await?;
 
         info!("Replication loop completed");
         Ok(())
@@ -421,6 +486,14 @@ impl ReplicationServer {
 
     async fn perform_graceful_shutdown(&mut self) -> ReplicationResult<()> {
         info!("Starting graceful shutdown process");
+
+        // Drop the event sink first (which holds an EventHistoryRecorder clone),
+        // then flush remaining event_history rows.
+        self.event_sink.take();
+        if let Some(entry) = self.event_history_entry.take() {
+            entry.shutdown().await;
+        }
+        self.event_history_recorder.take();
 
         // Send final feedback to PostgreSQL with the latest LSN position
         if let Err(e) = self.send_feedback() {

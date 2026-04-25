@@ -22,3 +22,4 @@ uuid = "1.18.0"
 hook0-client = { rev = "d7642e4ed32e9851eb67114053afcbd9cf9ab614", git = "https://github.com/hook0/hook0", features = [
 	"producer",
 ] }
+tokio-postgres = "0.7"

@@ -7,7 +7,21 @@
 use crate::core::errors::ReplicationResult;
 use libpq_sys::*;
 use std::ffi::{CStr, CString};
+use std::os::raw::c_int;
+use std::os::unix::io::RawFd;
 use std::ptr;
+
+/// Result of a non-blocking `PQgetCopyData` call.
+pub enum CopyData {
+    /// A complete row was returned.
+    Row(Vec<u8>),
+    /// COPY is still in progress but no row is currently available — caller
+    /// should wait for the connection's socket to become readable, then call
+    /// [`PGConnection::consume_input`] before retrying.
+    WouldBlock,
+    /// COPY stream has ended.
+    Done,
+}
 
 /// Safe wrapper for PostgreSQL connection using libpq
 ///
@@ -78,46 +92,63 @@ impl PGConnection {
         Ok(PGResult { result })
     }
 
-    /// Gets data from a COPY operation (blocking).
+    /// Puts the connection into non-blocking mode, so that I/O calls return
+    /// immediately rather than waiting on the socket.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> ReplicationResult<()> {
+        let arg = if nonblocking { 1 } else { 0 };
+        let result = unsafe { PQsetnonblocking(self.conn, arg) };
+        if result != 0 {
+            let error_msg = get_error_message(self.conn).unwrap_or("Unknown error".to_string());
+            return Err(crate::core::errors::ReplicationError::connection(format!(
+                "Failed to set non-blocking mode: {}",
+                error_msg
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the underlying socket file descriptor for the connection so it
+    /// can be registered with an async runtime's reactor.
+    pub fn socket(&self) -> ReplicationResult<RawFd> {
+        let fd: c_int = unsafe { PQsocket(self.conn) };
+        if fd < 0 {
+            return Err(crate::core::errors::ReplicationError::connection(
+                "Connection has no valid socket",
+            ));
+        }
+        Ok(fd as RawFd)
+    }
+
+    /// Drains pending bytes from the socket into libpq's input buffer. Must be
+    /// called after the socket reports readable before retrying
+    /// [`Self::get_copy_data`] in non-blocking mode.
+    pub fn consume_input(&self) -> ReplicationResult<()> {
+        let result = unsafe { PQconsumeInput(self.conn) };
+        if result != 1 {
+            let error_msg = get_error_message(self.conn).unwrap_or("Unknown error".to_string());
+            return Err(crate::core::errors::ReplicationError::protocol(format!(
+                "PQconsumeInput failed: {}",
+                error_msg
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reads one row from a COPY operation in non-blocking mode.
     ///
-    /// This function retrieves data from a PostgreSQL COPY operation. It's a wrapper around
-    /// libpq's PQgetCopyData function which handles the low-level details of reading
-    /// data from a COPY stream.
-    ///
-    /// # Note
-    /// If no COPY operation is in progress, this function will return an error.
-    ///
-    /// # Returns
-    /// A Result containing either Some(Vec<u8>) with the data, None if no more data or timeout,
-    /// or a ReplicationError if the operation fails
-    pub fn get_copy_data(&self) -> ReplicationResult<Option<Vec<u8>>> {
+    /// Returns [`CopyData::Row`] when a complete row is available,
+    /// [`CopyData::WouldBlock`] when the stream is still active but no row is
+    /// currently buffered (the caller should `await` the socket and then call
+    /// [`Self::consume_input`]), and [`CopyData::Done`] when COPY ends.
+    pub fn get_copy_data(&self) -> ReplicationResult<CopyData> {
         let mut buffer: *mut std::os::raw::c_char = ptr::null_mut();
 
-        /*
-        PQgetCopyData attempts to read a row of data from a COPY operation.
-
-        Data is always returned one data row at a time; if only a partial row is available, it is not returned.
-        Successful return of a data row involves allocating a chunk of memory to hold the data.
-        The buffer parameter must be non-NULL. *buffer is set to point to the allocated memory, or to NULL in cases where no buffer is returned. A non-NULL result buffer must be freed using PQfreemem when no longer needed.
-
-        When a row is successfully returned, the return value is the number of data bytes in the row (this will always be greater than zero).
-            The returned string is always null-terminated, though this is probably only useful for textual COPY.
-        A result of zero indicates that the COPY is still in progress, but no row is yet available (this is only possible when async is true).
-        A result of -1 indicates that the COPY is done.
-        A result of -2 indicates that an error occurred (consult PQerrorMessage for the reason).
-
-        When async is true (not zero), PQgetCopyData will not block waiting for input; it will return zero if the COPY is still in progress but no complete row is available.
-            (In this case wait for read-ready and then call PQconsumeInput before calling PQgetCopyData again.)
-        When async is false (zero), PQgetCopyData will block until data is available or the operation completes.
-
-        After PQgetCopyData returns -1, call PQgetResult to obtain the final result status of the COPY command. One may wait for this result to be available in the usual way. Then return to normal operation.
-        */
-        let copy_data_len = unsafe { PQgetCopyData(self.conn, &mut buffer, 0) };
+        // async = 1: return 0 immediately if no complete row is buffered.
+        let copy_data_len = unsafe { PQgetCopyData(self.conn, &mut buffer, 1) };
 
         match copy_data_len {
             -2 => {
                 let error_msg = get_error_message(self.conn).unwrap_or("Unknown error".to_string());
-
                 Err(crate::core::errors::ReplicationError::protocol(error_msg))
             }
             -1 => {
@@ -131,9 +162,9 @@ impl PGConnection {
                     return Err(crate::core::errors::ReplicationError::protocol(error_msg));
                 }
 
-                Ok(None)
-            } // COPY is done
-            0 => Ok(None), // COPY still in progress, no data available (in async mode) - impossible here since we use blocking mode
+                Ok(CopyData::Done)
+            }
+            0 => Ok(CopyData::WouldBlock),
             len => {
                 if buffer.is_null() {
                     return Err(crate::core::errors::ReplicationError::buffer(
@@ -146,7 +177,7 @@ impl PGConnection {
                 };
 
                 unsafe { PQfreemem(buffer as *mut std::os::raw::c_void) };
-                Ok(Some(data))
+                Ok(CopyData::Row(data))
             }
         }
     }
@@ -185,19 +216,23 @@ impl PGConnection {
 
     /// Flushes the connection buffer.
     ///
-    /// This function flushes any buffered output on the connection. It's a wrapper around
-    /// libpq's PQflush function which ensures that all pending data is sent to the server.
-    ///
-    /// # Returns
-    /// A Result indicating success or failure of the operation
-    pub fn flush(&self) -> ReplicationResult<()> {
+    /// Returns `Ok(true)` when all buffered output has been sent, `Ok(false)`
+    /// when bytes remain (only possible in non-blocking mode — caller should
+    /// wait for the socket to become writable and try again), and an error if
+    /// the underlying flush failed.
+    pub fn flush(&self) -> ReplicationResult<bool> {
         let result = unsafe { PQflush(self.conn) };
-        if result != 0 {
-            return Err(crate::core::errors::ReplicationError::protocol(
-                "Failed to flush connection",
-            ));
+        match result {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => {
+                let error_msg = get_error_message(self.conn).unwrap_or("Unknown error".to_string());
+                Err(crate::core::errors::ReplicationError::protocol(format!(
+                    "Failed to flush connection: {}",
+                    error_msg
+                )))
+            }
         }
-        Ok(())
     }
 }
 
