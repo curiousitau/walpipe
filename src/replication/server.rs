@@ -67,7 +67,7 @@ impl ReplicationServer {
         let (event_history_recorder, event_history_entry) =
             if config.uses_hook0_sink() {
                 let (recorder, entry) = EventHistoryRecorder::new(
-                    &config.connection_string,
+                    &config.connection_string_without_replication_param(),
                     100,
                     Duration::from_secs(10),
                 )

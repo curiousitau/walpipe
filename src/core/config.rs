@@ -241,6 +241,34 @@ impl ReplicationConfig {
     pub fn uses_stdout_sink(&self) -> bool {
         self.event_sink_type() == &EventSinkType::Stdout
     }
+
+    /// Returns a copy of the connection string with `replication=database`
+    /// (and any other `replication=` param) removed from the query string.
+    ///
+    /// The replication connection string contains `?replication=database&sslmode=require` —
+    /// the `replication=` param breaks a normal tokio-postgres connection, but
+    /// `sslmode=require` etc. must be preserved.
+    pub fn connection_string_without_replication_param(&self) -> String {
+        let qs_start = match self.connection_string.find('?') {
+            Some(pos) => pos,
+            None => return self.connection_string.clone(),
+        };
+
+        let before = &self.connection_string[..qs_start];
+        let raw_query = &self.connection_string[qs_start + 1..];
+
+        // Split on '&', drop any param starting with "replication=", rejoin
+        let params: Vec<&str> = raw_query
+            .split('&')
+            .filter(|p| !p.starts_with("replication="))
+            .collect();
+
+        if params.is_empty() {
+            before.to_string()
+        } else {
+            format!("{}?{}", before, params.join("&"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -318,6 +346,47 @@ mod tests {
             std::env::remove_var("DATABASE_URL");
             std::env::remove_var("EVENT_SINK");
             std::env::remove_var("HOOK0_API_URL");
+        }
+    }
+
+    #[test]
+    fn test_connection_string_without_replication_param() {
+        unsafe {
+            std::env::set_var(
+                "DATABASE_URL",
+                "postgres://user@host/db?replication=database&sslmode=require",
+            );
+            std::env::set_var("EVENT_SINK", "stdout");
+        }
+
+        let config = ReplicationConfig::from_env().unwrap();
+        assert_eq!(
+            config.connection_string_without_replication_param(),
+            "postgres://user@host/db?sslmode=require"
+        );
+
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("EVENT_SINK");
+        }
+    }
+
+    #[test]
+    fn test_connection_string_without_replication_param_noop_when_no_query() {
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgresql://test@localhost/test");
+            std::env::set_var("EVENT_SINK", "stdout");
+        }
+
+        let config = ReplicationConfig::from_env().unwrap();
+        assert_eq!(
+            config.connection_string_without_replication_param(),
+            "postgresql://test@localhost/test"
+        );
+
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("EVENT_SINK");
         }
     }
 }
