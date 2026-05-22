@@ -262,7 +262,24 @@ impl EventSink for Hook0EventSink {
                 attempt, max_retries, hook0_event
             );
 
-            match self.hook0_client.send_event(&hook0_event).await {
+            let send_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.hook0_client.send_event(&hook0_event),
+            )
+            .await;
+
+            let send_result = match send_result {
+                Ok(inner) => inner,
+                Err(_) => {
+                    error!(
+                        "Hook0 API request timed out after 30s (attempt {}/{}). Event ID: {}",
+                        attempt, max_retries, hook0_event.event_id
+                    );
+                    continue;
+                }
+            };
+
+            match send_result {
                 Ok(_) => {
                     debug!("Successfully sent event to Hook0 API");
                     Self::record_event_history(&self.event_history_recorder, &event_row).await;
