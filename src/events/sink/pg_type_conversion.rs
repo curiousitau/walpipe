@@ -24,10 +24,15 @@ pub(crate) enum EventConversionError {
 
 type RelationColumns = Vec<(String, PgType)>;
 
+const EVENT_STREAM_TABLE: &str = "event_stream";
+
 #[derive(Clone)]
 pub(crate) struct ReplicationEventDecoder {
     /// Map of table OIDs to their column definitions
     pub(crate) relations: HashMap<Oid, RelationColumns>,
+    /// Map of table OIDs to their relation names, used to filter
+    /// out changes from tables that are not of interest (e.g. walpipe_heartbeat)
+    relation_names: HashMap<Oid, String>,
 }
 
 #[allow(unused)]
@@ -107,6 +112,7 @@ impl ReplicationEventDecoder {
                     "Storing table OID {} {}",
                     relation.oid, relation.relation_name
                 );
+                self.relation_names.insert(relation.oid, relation.relation_name.clone());
                 self.relations.insert(
                     relation.oid,
                     relation.columns.iter().filter_map(to_tuple).collect(),
@@ -119,7 +125,12 @@ impl ReplicationEventDecoder {
                 tuple_data,
                 is_stream: _,
                 xid: _,
-            } => self.tuple_to_row(*relation_id, tuple_data),
+            } => {
+                if !self.is_event_stream_table(*relation_id) {
+                    return None;
+                }
+                self.tuple_to_row(*relation_id, tuple_data)
+            }
             ReplicationMessage::Update {
                 relation_id,
                 key_type: _,
@@ -127,8 +138,20 @@ impl ReplicationEventDecoder {
                 new_tuple_data,
                 is_stream: _,
                 xid: _,
-            } => self.tuple_to_row(*relation_id, new_tuple_data),
+            } => {
+                if !self.is_event_stream_table(*relation_id) {
+                    return None;
+                }
+                self.tuple_to_row(*relation_id, new_tuple_data)
+            }
             _ => None,
+        }
+    }
+
+    fn is_event_stream_table(&self, relation_id: Oid) -> bool {
+        match self.relation_names.get(&relation_id) {
+            Some(name) => name == EVENT_STREAM_TABLE,
+            None => false,
         }
     }
 
@@ -205,6 +228,7 @@ impl ReplicationEventDecoder {
     pub(crate) fn new() -> Self {
         Self {
             relations: HashMap::new(),
+            relation_names: HashMap::new(),
         }
     }
 }

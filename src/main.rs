@@ -33,9 +33,11 @@ mod utils;         // Utility functions for PostgreSQL integration
 use crate::core::{ReplicationConfig, ReplicationResult};
 use crate::replication::ReplicationServer;
 use clap::Parser;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{error, info};
+use std::time::Duration;
+use tokio::time::sleep;
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 
@@ -144,14 +146,36 @@ async fn main() -> ReplicationResult<()> {
     info!("Publication name: {}", config.publication_name);
     info!("Event sink type: {}", config.event_sink_type());
 
-    match run_replication_server(config, shutdown_signal).await {
-        Ok(()) => {
-            info!("Replication server completed successfully");
-            Ok(())
+    let mut retry_delay = Duration::from_secs(5);
+    let max_retry_delay = Duration::from_secs(60);
+
+    loop {
+        if shutdown_signal.load(Ordering::SeqCst) {
+            info!("Shutting down before reconnect attempt");
+            return Ok(());
         }
-        Err(e) => {
-            error!("Replication server failed: {}", e);
-            Err(e)
+
+        match run_replication_server(config.clone(), shutdown_signal.clone()).await {
+            Ok(()) => {
+                info!("Replication server completed successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                if shutdown_signal.load(Ordering::SeqCst) {
+                    info!("Shutting down after error: {}", e);
+                    return Ok(());
+                }
+
+                error!(
+                    "Replication server failed: {}. Reconnecting in {}s...",
+                    e,
+                    retry_delay.as_secs()
+                );
+
+                sleep(retry_delay).await;
+
+                retry_delay = (retry_delay * 2).min(max_retry_delay);
+            }
         }
     }
 }
