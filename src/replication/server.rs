@@ -476,6 +476,7 @@ impl ReplicationServer {
         }
 
         self.connection.put_copy_data(&reply_buf)?;
+        self.connection.flush()?;
 
         debug!(
             "Sent feedback with received LSN: {:x}, applied LSN: {:x}",
