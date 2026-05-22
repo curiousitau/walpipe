@@ -272,7 +272,7 @@ impl EventSink for Hook0EventSink {
                 Ok(inner) => inner,
                 Err(_) => {
                     error!(
-                        "Hook0 API request timed out after 30s (attempt {}/{}). Event ID: {}",
+                        "Hook0 API request timed out after 30s (attempt {}/{}). Event ID: {:?}",
                         attempt, max_retries, hook0_event.event_id
                     );
                     continue;
