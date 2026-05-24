@@ -311,9 +311,18 @@ impl ReplicationServer {
 
             self.check_and_send_feedback()?;
 
-            // Drain everything libpq has already buffered before going back
-            // to sleep on the socket.
+            // Drain everything from the socket into libpq's buffer and then
+            // extract complete messages.  consume_input() is called on every
+            // iteration to pull bytes from the kernel socket buffer into
+            // userspace.  This is essential with edge-triggered epoll: if
+            // data arrives on the socket between when we last drained and
+            // when we next wait on readable(), the edge transition (empty →
+            // readable) will not fire because the socket was never fully
+            // drained.  Calling consume_input() before each get_copy_data()
+            // guarantees the socket is empty before we fall through to the
+            // epoll wait.
             loop {
+                self.connection.consume_input()?;
                 match self.connection.get_copy_data()? {
                     CopyData::Done => break 'outer "stream ended",
                     CopyData::WouldBlock => break,
@@ -344,12 +353,9 @@ impl ReplicationServer {
                 }
             }
 
-            // Wait for more data, but wake up periodically to re-check the
-            // shutdown flag and send keepalive feedback.
             match tokio::time::timeout(idle_wakeup, async_fd.readable()).await {
-                Err(_) => continue, // periodic wakeup
+                Err(_) => continue,
                 Ok(Ok(mut guard)) => {
-                    self.connection.consume_input()?;
                     guard.clear_ready();
                 }
                 Ok(Err(e)) => return Err(crate::core::errors::ReplicationError::from(e)),

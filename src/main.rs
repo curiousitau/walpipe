@@ -173,10 +173,11 @@ async fn main() -> ReplicationResult<()> {
                 );
 
                 sleep(retry_delay).await;
-
                 retry_delay = (retry_delay * 2).min(max_retry_delay);
             }
         }
+
+        retry_delay = Duration::from_secs(5);
     }
 }
 
