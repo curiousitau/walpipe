@@ -31,7 +31,7 @@ pub(crate) struct ReplicationEventDecoder {
     /// Map of table OIDs to their column definitions
     pub(crate) relations: HashMap<Oid, RelationColumns>,
     /// Map of table OIDs to their relation names, used to filter
-    /// out changes from tables that are not of interest (e.g. walpipe_heartbeat)
+    /// out changes from tables that are not of interest (e.g. event_stream_heartbeat)
     relation_names: HashMap<Oid, String>,
 }
 
